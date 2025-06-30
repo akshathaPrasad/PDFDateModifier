@@ -1,0 +1,375 @@
+import React, { useEffect, useRef, useState } from 'react';
+import PropTypes from 'prop-types';
+import * as d3 from 'd3';
+import debounce from 'lodash/debounce';
+import { cyan } from '@mui/material/colors';
+import { Box, IconButton, Paper, Tooltip } from '@mui/material';
+import { useTheme, styled } from '@mui/material/styles';
+import { ZoomIn, ZoomOut, CenterFocusStrong } from '@mui/icons-material';
+import { CVSS_V3_SEVERITY_SCORE } from './index';
+
+const ButtonWrapper = styled(Box)(({ theme }) => ({
+  position: 'absolute',
+  top: theme.spacing(1),
+  right: theme.spacing(1),
+  zIndex: theme.spacing(1),
+  display: 'flex',
+  alignItems: 'center',
+  gap: theme.spacing(1)
+}));
+
+const LegendFilterWrapper = styled(Paper)(({ theme }) => ({
+  position: 'absolute',
+  bottom: theme.spacing(1),
+  left: theme.spacing(1),
+  padding: theme.spacing(1),
+  fontSize: theme.spacing(1.5)
+}));
+
+const SIZE_BY_SEVERITY = {
+  critical: 16,
+  high: 13,
+  medium: 11,
+  low: 9,
+  none: 8
+};
+
+const DependencyNetworkGraph = ({ dependencies, assetId }) => {
+  const theme = useTheme();
+  const svgRef = useRef();
+  const wrapperRef = useRef();
+  const [zoomRef, setZoomRef] = useState(null);
+  const [filterSeverities, setFilterSeverities] = useState(Object.keys(CVSS_V3_SEVERITY_SCORE));
+  const [selectedNodeId, setSelectedNodeId] = useState(null);
+  const ASSET_COLOR = cyan[theme.palette.mode === 'dark' ? 'A200' : 'A400'];
+
+  const fitToView = () => {
+    const svg = d3.select(svgRef.current);
+    const svgGroup = svg.select('g');
+    if (!svgGroup.node() || !zoomRef) return;
+    const bounds = svgGroup.node().getBBox();
+    const w = wrapperRef.current.clientWidth;
+    const h = wrapperRef.current.clientHeight;
+    const scale = Math.min(0.9 / (bounds.width / w), 0.9 / (bounds.height / h)) || 1;
+    const midX = bounds.x + bounds.width / 2;
+    const midY = bounds.y + bounds.height / 2;
+    const translate = [w / 2 - scale * midX, h / 2 - scale * midY];
+    svg
+      .transition()
+      .duration(700)
+      .ease(d3.easeCubicOut)
+      .call(zoomRef.transform, d3.zoomIdentity.translate(...translate).scale(scale));
+  };
+
+  const debouncedFit = useRef(debounce(fitToView, 300)).current;
+
+  useEffect(() => {
+    if (!assetId || !dependencies?.length) return;
+    d3.select(svgRef.current).selectAll('*').remove();
+    const wrapper = wrapperRef.current;
+    const width = wrapper.clientWidth;
+    const height = wrapper.clientHeight;
+    const repoNodes = {};
+    const depNodes = {};
+    const edgeMap = new Map();
+    const assetNode = { id: `asset:${assetId}`, label: assetId, type: 'asset' };
+
+    dependencies.forEach((dep) => {
+      const repoId = `repo:${dep.repository}`;
+      const depId = `dep:${dep.name}@${dep.version}`;
+      const severity = dep.displaySeverity?.toLowerCase() || 'none';
+      if (!repoNodes[repoId]) {
+        repoNodes[repoId] = { id: repoId, label: dep.repository, type: 'repo' };
+      }
+      if (!depNodes[depId] && filterSeverities.includes(severity)) {
+        depNodes[depId] = {
+          id: depId,
+          label: `${dep.name}@${dep.version}`,
+          type: 'dep',
+          severity
+        };
+      }
+      const edgeKey = `${repoId}__${depId}`;
+      if (!edgeMap.has(edgeKey)) {
+        edgeMap.set(edgeKey, []);
+      }
+      edgeMap.get(edgeKey).push(dep.fileName);
+    });
+
+    const nodes = [assetNode, ...Object.values(repoNodes), ...Object.values(depNodes)];
+    const links = [
+      // Repo → Asset
+      ...Object.keys(repoNodes).map((repoId) => ({
+        source: assetNode.id,
+        target: repoId
+      })),
+      // Repo → Dependency (filtered)
+      ...Array.from(edgeMap.entries())
+        .map(([key, files]) => {
+          const [repoId, depId] = key.split('__');
+          return {
+            source: repoId,
+            target: depId,
+            files
+          };
+        })
+        .filter((link) => depNodes[link.target])
+    ];
+    const svg = d3.select(svgRef.current).attr('width', width).attr('height', height);
+    const zoom = d3
+      .zoom()
+      .scaleExtent([0.1, 4])
+      .on('zoom', (event) => {
+        svgGroup.attr('transform', event.transform);
+      });
+    svg.call(zoom);
+    setZoomRef(() => zoom);
+    const svgGroup = svg.append('g');
+    const tooltip = d3
+      .select('body')
+      .append('div')
+      .attr('class', 'd3-tooltip')
+      .style('position', 'absolute')
+      .style('padding', '8px')
+      .style('background', theme.palette.background.paper)
+      .style('color', theme.palette.text.primary)
+      .style('border', `1px solid ${theme.palette.divider}`)
+      .style('border-radius', '4px')
+      .style('pointer-events', 'none')
+      .style('font-size', '14px')
+      .style('display', 'none');
+    const simulation = d3
+      .forceSimulation(nodes)
+      .force(
+        'link',
+        d3
+          .forceLink(links)
+          .id((d) => d.id)
+          .distance(100)
+      )
+      .force('charge', d3.forceManyBody().strength(-250))
+      .force('center', d3.forceCenter(width / 2, height / 2));
+    svgGroup
+      .append('g')
+      .attr('stroke', '#ccc')
+      .attr('stroke-opacity', 0.7)
+      .selectAll('line')
+      .data(links)
+      .join('line')
+      .attr('stroke-width', 1.5)
+      .on('mouseover', function (event, d) {
+        if (d.files) {
+          tooltip
+            .html(`<strong>Files:</strong><br/>${d.files.map((f) => `• ${f}`).join('<br/>')}`)
+            .style('left', event.pageX + 10 + 'px')
+            .style('top', event.pageY + 'px')
+            .style('display', 'block');
+        }
+      })
+      .on('mouseout', () => {
+        tooltip.style('display', 'none');
+      });
+    const node = svgGroup
+      .append('g')
+      .attr('stroke', theme.palette.divider)
+      .attr('stroke-width', (d) => (d?.type === 'asset' ? 2.5 : 1.5))
+      .selectAll('circle')
+      .data(nodes)
+      .join('circle')
+      .attr('r', (d) => {
+        if (d.type === 'asset') return 20;
+        if (d.type === 'repo') return 18;
+        return SIZE_BY_SEVERITY[d.severity]; // Default size for dependencies
+      })
+      .attr('fill', (d) => {
+        if (d.type === 'repo') return theme.palette.secondary.main;
+        if (d.type === 'asset') return ASSET_COLOR;
+        return theme.palette[d.severity].main;
+      })
+      .style('opacity', (d) => (selectedNodeId && d.id !== selectedNodeId ? 0.2 : 1))
+      .on('click', (_, d) => {
+        setSelectedNodeId((prev) => (prev === d.id ? null : d.id));
+      })
+      .on('mouseover', function (event, d) {
+        tooltip
+          .html(
+            d.type === 'repo'
+              ? `<strong>Repository:</strong> ${d.label}`
+              : d.type === 'asset'
+                ? `<strong>Asset:</strong> ${d.label}`
+                : `<strong>Dependency:</strong> ${d.label}`
+          )
+          .style('left', event.pageX + 10 + 'px')
+          .style('top', event.pageY + 'px')
+          .style('display', 'block');
+      })
+      .on('mouseout', () => {
+        tooltip.style('display', 'none');
+      })
+      .call(d3.drag().on('start', dragstarted).on('drag', dragged).on('end', dragended));
+    const labels = svgGroup
+      .append('g')
+      .selectAll('text')
+      .data(nodes.filter((d) => d.type === 'asset'))
+      .join('text')
+      .text((d) => d.label)
+      .attr('font-size', 10)
+      .attr('text-anchor', 'middle')
+      .attr('fill', theme.palette.text.primary);
+    simulation.on('tick', () => {
+      svgGroup
+        .selectAll('line')
+        .attr('x1', (d) => d.source.x)
+        .attr('y1', (d) => d.source.y)
+        .attr('x2', (d) => d.target.x)
+        .attr('y2', (d) => d.target.y);
+      node.attr('cx', (d) => d.x).attr('cy', (d) => d.y);
+      labels.attr('x', (d) => d.x).attr('y', (d) => d.y + 16);
+    });
+    simulation.on('end', debouncedFit);
+    debouncedFit(); // initial zoom-out to fit
+    window.addEventListener('resize', debouncedFit);
+    function dragstarted(event, d) {
+      if (!event.active) simulation.alphaTarget(0.3).restart();
+      d.fx = d.x;
+      d.fy = d.y;
+    }
+    function dragged(event, d) {
+      d.fx = event.x;
+      d.fy = event.y;
+    }
+    function dragended(event, d) {
+      if (!event.active) simulation.alphaTarget(0);
+      d.fx = null;
+      d.fy = null;
+    }
+    return () => {
+      tooltip.remove();
+    };
+  }, [dependencies, assetId, filterSeverities, selectedNodeId, theme]);
+  const toggleSeverity = (severity) => {
+    setFilterSeverities((prev) =>
+      prev.includes(severity) ? prev.filter((s) => s !== severity) : [...prev, severity]
+    );
+  };
+  return (
+    <div style={{ width: '100%', height: '100%', position: 'relative' }}>
+      {/* Controls */}
+      <ButtonWrapper>
+        <Tooltip arrow title="Zoom In">
+          <IconButton
+            color="primary"
+            onClick={() =>
+              zoomRef &&
+              d3
+                .select(svgRef.current)
+                .transition()
+                .duration(700)
+                .ease(d3.easeCubicOut)
+                .call(zoomRef.scaleBy, 1.2)
+            }>
+            <ZoomIn />
+          </IconButton>
+        </Tooltip>
+        <Tooltip arrow title="Zoom Out">
+          <IconButton
+            color="primary"
+            onClick={() =>
+              zoomRef &&
+              d3
+                .select(svgRef.current)
+                .transition()
+                .duration(700)
+                .ease(d3.easeCubicOut)
+                .call(zoomRef.scaleBy, 0.8)
+            }>
+            <ZoomOut />
+          </IconButton>
+        </Tooltip>
+        <Tooltip arrow title="Reset Zoom">
+          <IconButton
+            color="primary"
+            onClick={() =>
+              zoomRef &&
+              d3
+                .select(svgRef.current)
+                .transition()
+                .duration(700)
+                .ease(d3.easeCubicOut)
+                .call(zoomRef.transform, d3.zoomIdentity)
+            }>
+            <CenterFocusStrong />
+          </IconButton>
+        </Tooltip>
+      </ButtonWrapper>
+      {/* Legend & Filter */}
+      <LegendFilterWrapper elevation={3}>
+        <strong>Legend & Filter:</strong>
+        <div>
+          <span
+            style={{
+              background: ASSET_COLOR,
+              display: 'inline-block',
+              width: 10,
+              height: 10,
+              marginRight: 5
+            }}
+          />{' '}
+          Asset
+        </div>
+        <div>
+          <span
+            style={{
+              background: theme.palette.secondary.main,
+              display: 'inline-block',
+              width: 10,
+              height: 10,
+              marginRight: 5
+            }}
+          />{' '}
+          Repository
+        </div>
+        {Object.keys(CVSS_V3_SEVERITY_SCORE).map((risk) => (
+          <div key={risk}>
+            <label>
+              <input
+                type="checkbox"
+                checked={filterSeverities.includes(risk)}
+                onChange={() => toggleSeverity(risk)}
+              />
+              <span
+                style={{
+                  background: theme.palette[risk].main,
+                  display: 'inline-block',
+                  width: 10,
+                  height: 10,
+                  margin: '0 5px'
+                }}
+              />
+              {CVSS_V3_SEVERITY_SCORE[risk]?.label}
+            </label>
+          </div>
+        ))}
+      </LegendFilterWrapper>
+      {/* Graph container */}
+      <div ref={wrapperRef} style={{ width: '100%', height: 769 }}>
+        <svg ref={svgRef} style={{ width: '100%', height: '100%' }} />
+      </div>
+    </div>
+  );
+};
+
+DependencyNetworkGraph.propTypes = {
+  assetId: PropTypes.number.isRequired,
+  dependencies: PropTypes.arrayOf(
+    PropTypes.shape({
+      repository: PropTypes.string.isRequired,
+      name: PropTypes.string.isRequired,
+      version: PropTypes.string.isRequired,
+      displaySeverity: PropTypes.string,
+      fileName: PropTypes.string
+    })
+  ).isRequired
+};
+
+export default DependencyNetworkGraph;
