@@ -1,0 +1,269 @@
+import React, { useEffect, useRef, useState } from 'react';
+import PropTypes from 'prop-types';
+import * as d3 from 'd3';
+import { cyan } from '@mui/material/colors';
+import { Box, IconButton, Paper, Tooltip } from '@mui/material';
+import { useTheme, styled } from '@mui/material/styles';
+import { ZoomIn, ZoomOut, CenterFocusStrong } from '@mui/icons-material';
+import { CVSS_V3_SEVERITY_SCORE } from './index';
+
+const ButtonWrapper = styled(Box)(({ theme }) => ({
+  position: 'absolute',
+  top: theme.spacing(1),
+  right: theme.spacing(1),
+  zIndex: theme.spacing(1),
+  display: 'flex',
+  alignItems: 'center',
+  gap: theme.spacing(1)
+}));
+
+const LegendFilterWrapper = styled(Paper)(({ theme }) => ({
+  position: 'absolute',
+  bottom: theme.spacing(1),
+  left: theme.spacing(1),
+  padding: theme.spacing(1),
+  fontSize: theme.spacing(1.5)
+}));
+
+const FlexBox = styled(Box)(({ theme }) => ({
+  display: 'flex',
+  alignItems: 'center',
+  gap: theme.spacing(0.5)
+}));
+
+const ColoredBox = styled('span')(({ background, theme }) => ({
+  background,
+  display: 'inline-block',
+  width: theme.spacing(1.25),
+  height: theme.spacing(1.25),
+  borderRadius: theme.spacing(1.25)
+}));
+
+const SIZE_BY_SEVERITY = {
+  critical: 16,
+  high: 13,
+  medium: 11,
+  low: 9,
+  none: 8
+};
+
+const ZOOM_DURATION = 700; // Duration for zoom transitions in milliseconds
+
+const DependencyNetworkGraph = ({ dependencies, assetId }) => {
+  const theme = useTheme();
+  const svgRef = useRef();
+  const wrapperRef = useRef();
+  const [zoomRef, setZoomRef] = useState(null);
+  const ASSET_COLOR = cyan[theme.palette.mode === 'dark' ? 'A200' : 'A400'];
+  const [filterSeverities, setFilterSeverities] = useState(Object.keys(CVSS_V3_SEVERITY_SCORE));
+
+  useEffect(() => {
+    if (!assetId || !dependencies?.length) return;
+    d3.select(svgRef.current).selectAll('*').remove();
+    const wrapper = wrapperRef.current;
+    const width = wrapper.clientWidth;
+    const height = wrapper.clientHeight;
+    const svg = d3.select(svgRef.current).attr('width', width).attr('height', height);
+    const svgGroup = svg.append('g');
+    const zoom = d3
+      .zoom()
+      .scaleExtent([0.1, 4])
+      .on('zoom', (event) => {
+        svgGroup.attr('transform', event.transform);
+      });
+    svg.call(zoom);
+    setZoomRef(() => zoom);
+    const repoNodes = {},
+      depNodes = {},
+      edgeMap = new Map();
+    const assetNode = { id: `asset:${assetId}`, label: assetId, type: 'asset' };
+    dependencies.forEach((dep) => {
+      const repoId = `repo:${dep.repository}`;
+      const depId = `dep:${dep.name}@${dep.version}`;
+      const severity = dep.displaySeverity?.toLowerCase() || 'none';
+      if (!repoNodes[repoId])
+        repoNodes[repoId] = { id: repoId, label: dep.repository, type: 'repo' };
+      if (!depNodes[depId] && filterSeverities.includes(severity)) {
+        depNodes[depId] = {
+          id: depId,
+          label: `${dep.name}@${dep.version}`,
+          type: 'dep',
+          severity
+        };
+      }
+      const edgeKey = `${repoId}__${depId}`;
+      if (!edgeMap.has(edgeKey)) edgeMap.set(edgeKey, []);
+      edgeMap.get(edgeKey).push(dep.fileName);
+    });
+    const nodes = [assetNode, ...Object.values(repoNodes), ...Object.values(depNodes)];
+    const links = [
+      ...Object.keys(repoNodes).map((repoId) => ({ source: assetNode.id, target: repoId })),
+      ...Array.from(edgeMap.entries())
+        .map(([key, files]) => {
+          const [repoId, depId] = key.split('__');
+          return { source: repoId, target: depId, files };
+        })
+        .filter((link) => depNodes[link.target])
+    ];
+
+    const simulation = d3
+      .forceSimulation(nodes)
+      .force(
+        'link',
+        d3
+          .forceLink(links)
+          .id((d) => d.id)
+          .distance(100)
+      )
+      .force('charge', d3.forceManyBody().strength(-250))
+      .force('center', d3.forceCenter(width / 2, height / 2));
+
+    svgGroup
+      .append('g')
+      .selectAll('line')
+      .data(links)
+      .join('line')
+      .attr('stroke', theme.palette.grey[500])
+      .attr('stroke-opacity', 0.7)
+      .attr('stroke-width', 1.5);
+    svgGroup
+      .append('g')
+      .selectAll('circle')
+      .data(nodes)
+      .join('circle')
+      .attr('r', (d) =>
+        d.type === 'asset' ? 25 : d.type === 'repo' ? 13 : SIZE_BY_SEVERITY[d.severity]
+      )
+      .attr('fill', (d) =>
+        d.type === 'asset'
+          ? ASSET_COLOR
+          : d.type === 'repo'
+            ? theme.palette.secondary.main
+            : theme.palette[d.severity].main
+      )
+      .call(
+        d3
+          .drag()
+          .on('start', (event, d) => {
+            if (!event.active) simulation.alphaTarget(0.3).restart();
+            d.fx = d.x;
+            d.fy = d.y;
+          })
+          .on('drag', (event, d) => {
+            d.fx = event.x;
+            d.fy = event.y;
+          })
+          .on('end', (event, d) => {
+            if (!event.active) simulation.alphaTarget(0);
+            d.fx = null;
+            d.fy = null;
+          })
+      );
+    simulation.on('tick', () => {
+      svgGroup
+        .selectAll('line')
+        .attr('x1', (d) => d.source.x)
+        .attr('y1', (d) => d.source.y)
+        .attr('x2', (d) => d.target.x)
+        .attr('y2', (d) => d.target.y);
+      svgGroup
+        .selectAll('circle')
+        .attr('cx', (d) => d.x)
+        .attr('cy', (d) => d.y);
+    });
+    return () => simulation.stop();
+  }, [dependencies, assetId, filterSeverities, theme]);
+
+  return (
+    <div style={{ width: '100%', height: '100%', position: 'relative' }}>
+      <ButtonWrapper>
+        <Tooltip title="Zoom In">
+          <IconButton
+            color="primary"
+            onClick={() =>
+              zoomRef &&
+              d3
+                .select(svgRef.current)
+                .transition()
+                .duration(ZOOM_DURATION)
+                .call(zoomRef.scaleBy, 1.2)
+            }>
+            <ZoomIn />
+          </IconButton>
+        </Tooltip>
+        <Tooltip title="Zoom Out">
+          <IconButton
+            color="primary"
+            onClick={() =>
+              zoomRef &&
+              d3
+                .select(svgRef.current)
+                .transition()
+                .duration(ZOOM_DURATION)
+                .call(zoomRef.scaleBy, 0.8)
+            }>
+            <ZoomOut />
+          </IconButton>
+        </Tooltip>
+        <Tooltip title="Reset Zoom">
+          <IconButton
+            color="primary"
+            onClick={() =>
+              zoomRef &&
+              d3
+                .select(svgRef.current)
+                .transition()
+                .duration(ZOOM_DURATION)
+                .call(zoomRef.transform, d3.zoomIdentity)
+            }>
+            <CenterFocusStrong />
+          </IconButton>
+        </Tooltip>
+      </ButtonWrapper>
+      <LegendFilterWrapper>
+        <strong>Legend & Filter:</strong>
+        <FlexBox>
+          <ColoredBox background={ASSET_COLOR} />
+          Asset
+        </FlexBox>
+        <FlexBox>
+          <ColoredBox background={theme.palette.secondary.main} />
+          Repository
+        </FlexBox>
+        {Object.keys(CVSS_V3_SEVERITY_SCORE).map((risk) => (
+          <FlexBox key={risk}>
+            <input
+              type="checkbox"
+              checked={filterSeverities.includes(risk)}
+              onChange={() =>
+                setFilterSeverities((prev) =>
+                  prev.includes(risk) ? prev.filter((s) => s !== risk) : [...prev, risk]
+                )
+              }
+            />
+            <ColoredBox background={theme.palette[risk].main} mr={0} />
+            {CVSS_V3_SEVERITY_SCORE[risk]?.label}
+          </FlexBox>
+        ))}
+      </LegendFilterWrapper>
+      <div ref={wrapperRef} style={{ width: '100%', height: 769 }}>
+        <svg ref={svgRef} style={{ width: '100%', height: '100%' }} />
+      </div>
+    </div>
+  );
+};
+
+DependencyNetworkGraph.propTypes = {
+  assetId: PropTypes.number.isRequired,
+  dependencies: PropTypes.arrayOf(
+    PropTypes.shape({
+      repository: PropTypes.string.isRequired,
+      name: PropTypes.string.isRequired,
+      version: PropTypes.string.isRequired,
+      displaySeverity: PropTypes.string,
+      fileName: PropTypes.string
+    })
+  ).isRequired
+};
+
+export default DependencyNetworkGraph;
