@@ -1,0 +1,136 @@
+import React, { useCallback, useEffect, useState } from 'react';
+import PropTypes from 'prop-types';
+import { useLazyQuery } from '@apollo/client';
+import { Box, Skeleton, styled } from '@mui/material';
+import {
+  DEPENDENCIES_FOR_VISUALIZATION,
+  SDE_FOR_VISUALIZATION,
+  ForceDirectedNetworkGraph,
+  ErrorMessageRenderer,
+  OverviewCardWrapper
+} from './index';
+
+const CACHE_BLOCK_SIZE = 200;
+
+const MUISkeleton = styled(Skeleton)(({ theme }) => ({
+  borderRadius: theme.spacing(2)
+}));
+
+function Visualization({ assetId }) {
+  const [loadingDependencies, setLoadingDependencies] = useState(true);
+  const [loadingSDE, setLoadingSDE] = useState(true);
+  const [error, setError] = useState(null);
+  const [dependenciesList, setDependenciesList] = useState([]);
+  const [sensitiveDataElements, setSensitiveDataElements] = useState([]);
+  const [fetchDependencies] = useLazyQuery(DEPENDENCIES_FOR_VISUALIZATION);
+  const [fetchSDE] = useLazyQuery(SDE_FOR_VISUALIZATION);
+
+  const callToGraphQLQuery = useCallback(
+    (query, filter, offset) =>
+      new Promise((resolve, reject) => {
+        query({ variables: { first: CACHE_BLOCK_SIZE, offset, filter } }).then(
+          ({ error, data }) => {
+            if (error) {
+              reject(error);
+            } else {
+              resolve(data);
+            }
+          }
+        );
+      })
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    const DEPENDENCIES_FILTER = { assetId: { equalTo: assetId }, isArchived: { equalTo: false } };
+    const SDE_FILTER = {
+      categoryType: { equalTo: 'secret' },
+      assetId: { equalTo: assetId },
+      isArchived: { equalTo: false }
+    };
+    // Fetch all dependencies and sensitive data in a paginated manner
+    const fetchAllDependencies = async (offset = 0) => {
+      try {
+        const data = await callToGraphQLQuery(fetchDependencies, DEPENDENCIES_FILTER, offset);
+        if (cancelled) return;
+        const { edges, pageInfo } = data?.dependencyInsights ?? {};
+        const newItems =
+          edges?.map((edge) => ({
+            ...edge?.node,
+            branch: edge?.node?.repositoryInsightBySourceAndOrgAndRepository?.defaultBranch
+          })) ?? [];
+        setDependenciesList((prev) => [...prev, ...newItems]);
+        if (pageInfo.hasNextPage) {
+          fetchAllDependencies(offset + CACHE_BLOCK_SIZE);
+        } else {
+          setLoadingDependencies(false);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setError(err);
+          setLoadingDependencies(false);
+        }
+      }
+    };
+    const fetchAllSDE = async (offset = 0) => {
+      try {
+        const data = await callToGraphQLQuery(fetchSDE, SDE_FILTER, offset);
+        if (cancelled) return;
+        const { edges, pageInfo } = data?.sensitiveDataElementInsights ?? {};
+        const newItems = edges?.map((edge) => edge?.node) ?? [];
+        setSensitiveDataElements((prev) => [...prev, ...newItems]);
+        if (pageInfo.hasNextPage) {
+          fetchAllSDE(offset + CACHE_BLOCK_SIZE);
+        } else {
+          setLoadingSDE(false);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setError(err);
+          setLoadingSDE(false);
+        }
+      }
+    };
+    setLoadingDependencies(true);
+    setLoadingSDE(true);
+    setDependenciesList([]); // Clear existing dependencies state if remounting
+    setSensitiveDataElements([]); // Clear existing sensitive data state if remounting
+    fetchAllDependencies();
+    fetchAllSDE();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  return (
+    <Box mt={2}>
+      {loadingDependencies &&
+      loadingSDE &&
+      !error &&
+      dependenciesList.length === 0 &&
+      sensitiveDataElements.length === 0 ? (
+        <MUISkeleton animation="wave" variant="rounded" height={800} width="100%" />
+      ) : (
+        <OverviewCardWrapper height={100}>
+          {error ? (
+            <ErrorMessageRenderer error={error} displayRefreshButton />
+          ) : dependenciesList.length ? (
+            <ForceDirectedNetworkGraph
+              loadingDependencies={loadingDependencies}
+              loadingSDE={loadingSDE}
+              dependencies={dependenciesList}
+              sensitiveDataElements={sensitiveDataElements}
+              assetId={assetId}
+            />
+          ) : null}
+        </OverviewCardWrapper>
+      )}
+    </Box>
+  );
+}
+
+Visualization.propTypes = {
+  assetId: PropTypes.number
+};
+
+export default Visualization;
